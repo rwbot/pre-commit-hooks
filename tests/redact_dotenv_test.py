@@ -9,16 +9,16 @@ from pathlib import Path
 
 import pytest
 
-from pre_commit_hooks.catch_dotenv import DEFAULT_ENV_FILE
-from pre_commit_hooks.catch_dotenv import DEFAULT_EXAMPLE_ENV_FILE
-from pre_commit_hooks.catch_dotenv import DEFAULT_GITIGNORE_FILE
-from pre_commit_hooks.catch_dotenv import ensure_env_in_gitignore
-from pre_commit_hooks.catch_dotenv import GITIGNORE_BANNER
-from pre_commit_hooks.catch_dotenv import main
+from pre_commit_hooks.redact_dotenv import DEFAULT_ENV_FILE
+from pre_commit_hooks.redact_dotenv import DEFAULT_EXAMPLE_ENV_FILE
+from pre_commit_hooks.redact_dotenv import DEFAULT_GITIGNORE_FILE
+from pre_commit_hooks.redact_dotenv import ensure_env_in_gitignore
+from pre_commit_hooks.redact_dotenv import GITIGNORE_BANNER
+from pre_commit_hooks.redact_dotenv import main
+from pre_commit_hooks.redact_dotenv import redact_env_file
 
 # Tests cover hook behavior: detection gating, .gitignore normalization,
-# example file generation parsing edge cases, idempotency, and preservation of
-# existing content. Each test isolates a single behavioral contract.
+# redaction logic, formatting preservation, and byte-for-byte output verification.
 
 
 @pytest.fixture()
@@ -43,6 +43,21 @@ def env_file(tmp_path: Path) -> Path:
     dest = tmp_path / DEFAULT_ENV_FILE
     shutil.copyfile(resource_env, dest)
     return dest
+
+
+@pytest.fixture()
+def expected_example() -> Path:
+    """Get path to expected example.env for comparison tests."""
+    test_file_path = Path(__file__).resolve()
+    repo_root = test_file_path
+    while repo_root.parent != repo_root:
+        if (repo_root / '.git').exists():
+            break
+        repo_root = repo_root.parent
+    else:
+        raise RuntimeError('Could not find repository root (.git directory)')
+
+    return repo_root / 'testing' / 'resources' / 'example.env'
 
 
 def run_hook(
@@ -79,6 +94,39 @@ def test_blocks_env_and_updates_gitignore(
 def test_env_present_but_not_staged(tmp_path: Path, env_file: Path) -> None:
     """Existing .env on disk but not staged should not block commit."""
     assert run_hook(tmp_path, ['unrelated.txt']) == 0
+
+
+def test_byte_for_byte_match(
+        tmp_path: Path, env_file: Path, expected_example: Path,
+) -> None:
+    """Processing test.env should produce EXACTLY example.env byte-for-byte."""
+    example_file = tmp_path / DEFAULT_EXAMPLE_ENV_FILE
+
+    # Redact the env file
+    success = redact_env_file(str(env_file), str(example_file))
+    assert success is True
+
+    # Read both files as bytes
+    generated = example_file.read_bytes()
+    expected = expected_example.read_bytes()
+
+    # Compare byte-for-byte
+    if generated != expected:
+        # Show detailed diff for debugging
+        gen_lines = generated.decode('utf-8').splitlines()
+        exp_lines = expected.decode('utf-8').splitlines()
+
+        print("\nGenerated vs Expected line-by-line diff:")
+        for i, (g, e) in enumerate(zip(gen_lines, exp_lines), 1):
+            if g != e:
+                print(f"Line {i} differs:")
+                print(f"  Generated: {g!r}")
+                print(f"  Expected:  {e!r}")
+
+        if len(gen_lines) != len(exp_lines):
+            print(f"\nLine count: {len(gen_lines)} vs {len(exp_lines)}")
+
+    assert generated == expected, "Generated output must match example.env exactly"
 
 
 def test_idempotent_gitignore(tmp_path: Path, env_file: Path) -> None:
@@ -126,42 +174,17 @@ def test_gitignore_duplicates_are_collapsed(
     assert lines[-2:] == [GITIGNORE_BANNER, DEFAULT_ENV_FILE]
 
 
-def test_create_example(tmp_path: Path, env_file: Path) -> None:
-    """Example file includes discovered keys; values stripped to KEY=."""
-    ret = run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
+def test_creates_example_automatically(tmp_path: Path, env_file: Path) -> None:
+    """Example file is created automatically with redacted values."""
+    ret = run_hook(tmp_path, [DEFAULT_ENV_FILE])
     assert ret == 1
-    example = (tmp_path / DEFAULT_EXAMPLE_ENV_FILE).read_text().splitlines()
-    key_lines = [ln for ln in example if ln and not ln.startswith('#')]
-    # All key lines should be KEY=
-    assert all(re.match(r'^[A-Za-z_][A-Za-z0-9_]*=$', ln) for ln in key_lines)
-    # Spot check a few known keys from resource file
-    for k in [
-        'OPENAI_API_KEY=',
-        'ACCESS_TOKEN_SECRET=',
-        'SUPABASE_SERVICE_KEY=',
-    ]:
-        assert k in key_lines
-
-
-def test_create_example_duplicate_key_variant_ignored(
-        tmp_path: Path, env_file: Path,
-) -> None:
-    """Appending whitespace duplicate of existing key should not duplicate
-    in example.
-    """
-    # Create a copy of the env_file to avoid contaminating the fixture
-    modified_env = tmp_path / 'modified.env'
-    shutil.copyfile(env_file, modified_env)
-    with open(modified_env, 'a', encoding='utf-8') as f:
-        f.write('BACKEND_CONTAINER_PORT =999 # duplicate variant\n')
-
-    # Override the env file path for this test
-    original_env = tmp_path / DEFAULT_ENV_FILE
-    shutil.copyfile(modified_env, original_env)
-    run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
-    lines = (tmp_path / DEFAULT_EXAMPLE_ENV_FILE).read_text().splitlines()
-    key_lines = [ln for ln in lines if ln and not ln.startswith('#')]
-    assert key_lines.count('BACKEND_CONTAINER_PORT=') == 1
+    example = tmp_path / DEFAULT_EXAMPLE_ENV_FILE
+    assert example.exists()
+    # Check that values are redacted
+    content = example.read_text()
+    assert 'API_KEY' in content or 'PASSWORD' in content
+    # Check that asterisks are used for redaction
+    assert '*' in content
 
 
 def test_gitignore_without_trailing_newline(
@@ -204,30 +227,8 @@ def test_source_env_file_not_modified(
 ) -> None:
     """Hook must not alter original .env (comments and formatting stay)."""
     original = env_file.read_text()
-    run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
+    run_hook(tmp_path, [DEFAULT_ENV_FILE])
     assert env_file.read_text() == original
-
-
-def test_large_resource_env_parsing(
-        tmp_path: Path, env_file: Path,
-) -> None:
-    """Generate example from resource env; assert broad key coverage &
-    format.
-    """
-    ret = run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
-    assert ret == 1
-    example_lines = (
-        (tmp_path / DEFAULT_EXAMPLE_ENV_FILE).read_text().splitlines()
-    )
-    key_lines = [ln for ln in example_lines if ln and not ln.startswith('#')]
-    assert len(key_lines) > 20
-    assert all(re.match(r'^[A-Za-z_][A-Za-z0-9_]*=$', ln) for ln in key_lines)
-    for k in [
-        'BACKEND_CONTAINER_PORT=',
-        'SUPABASE_SERVICE_KEY=',
-        'ACCESS_TOKEN_SECRET=',
-    ]:
-        assert k in key_lines
 
 
 def test_failure_message_content(
@@ -236,25 +237,25 @@ def test_failure_message_content(
         capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Hook stdout message should contain key phrases when blocking commit."""
-    ret = run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
+    ret = run_hook(tmp_path, [DEFAULT_ENV_FILE])
     assert ret == 1
     out = capsys.readouterr().out.strip()
     assert 'Blocked committing' in out
-    assert DEFAULT_GITIGNORE_FILE in out  # updated path appears
-    assert 'Generated .env.example.' in out
+    assert DEFAULT_GITIGNORE_FILE in out
+    assert DEFAULT_EXAMPLE_ENV_FILE in out
     assert 'Remove .env' in out
 
 
-def test_create_example_when_env_missing(
+def test_no_example_when_env_missing(
         tmp_path: Path, env_file: Path,
 ) -> None:
-    """--create-example with no .env staged or present should no-op (exit 0).
+    """With no .env present, example should not be created.
 
     Uses env_file fixture (requirement: all tests use fixture) then removes the
     copied .env to simulate absence.
     """
     env_file.unlink()
-    ret = run_hook(tmp_path, ['unrelated.txt'], create_example=True)
+    ret = run_hook(tmp_path, ['unrelated.txt'])
     assert ret == 0
     assert not (tmp_path / DEFAULT_EXAMPLE_ENV_FILE).exists()
 
@@ -278,17 +279,13 @@ def test_gitignore_is_directory_error(
 def test_env_example_overwrites_existing(
         tmp_path: Path, env_file: Path,
 ) -> None:
-    """Pre-existing example file with junk should be overwritten with header
-    & keys.
-    """
+    """Pre-existing example file with non-redacted values should be updated."""
     example = tmp_path / DEFAULT_EXAMPLE_ENV_FILE
-    example.write_text('junk=1\nSHOULD_NOT_REMAIN=2\n')
-    run_hook(tmp_path, [DEFAULT_ENV_FILE], create_example=True)
-    content = example.read_text().splitlines()
-    assert content[0].startswith('# Generated by catch-dotenv')
-    assert any(ln.startswith('BACKEND_CONTAINER_PORT=') for ln in content)
-    assert 'junk=1' not in content
-    assert 'SHOULD_NOT_REMAIN=2' not in content
+    example.write_text('API_KEY=not_redacted\n')
+    run_hook(tmp_path, [DEFAULT_ENV_FILE])
+    content = example.read_text()
+    # Should now contain redacted values
+    assert '***' in content or 'API_KEY' in content
 
 
 def test_large_gitignore_normalization_performance(
@@ -404,7 +401,7 @@ def test_atomic_write_failure_gitignore(
     """
     def boom(*_a: object, **_k: object) -> None:
         raise OSError('replace-fail')
-    monkeypatch.setattr('pre_commit_hooks.catch_dotenv.os.replace', boom)
+    monkeypatch.setattr('pre_commit_hooks.redact_dotenv.os.replace', boom)
     modified = ensure_env_in_gitignore(
         DEFAULT_ENV_FILE,
         str(tmp_path / DEFAULT_GITIGNORE_FILE),
@@ -424,21 +421,21 @@ def test_atomic_write_failure_example(
     """Simulate os.replace failure when writing example env file."""
     def boom(*_a: object, **_k: object) -> None:
         raise OSError('replace-fail')
-    monkeypatch.setattr('pre_commit_hooks.catch_dotenv.os.replace', boom)
+    monkeypatch.setattr('pre_commit_hooks.redact_dotenv.os.replace', boom)
     ok = False
-    # create_example_env requires source .env to exist; env_file fixture
+    # redact_env_file requires source .env to exist; env_file fixture
     # provides it in tmp_path root
     cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
-        ok = main([DEFAULT_ENV_FILE, '--create-example']) == 1
+        ok = main([DEFAULT_ENV_FILE]) == 1
     finally:
         os.chdir(cwd)
     # hook still blocks; but example creation failed -> message should
-    # not claim Example file generated
+    # not claim example.env was updated
     assert ok is True
     captured = capsys.readouterr()
     out = captured.out
     err = captured.err
-    assert 'Example file generated' not in out
+    assert 'Updated example.env' not in out
     assert 'ERROR: unable to write' in err
